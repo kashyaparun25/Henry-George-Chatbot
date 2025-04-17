@@ -20,6 +20,17 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
+def _on_followup_click(question):
+    # clear any previous pending
+    st.session_state.pending_question = None
+    # push the new question into the chat history
+    st.session_state.messages.append({"role": "user", "content": question})
+    # mark it for processing
+    st.session_state.pending_question = question
+    # re‑run immediately
+    st.rerun()
+
+
 # Constants
 # Handle API keys with fallback for development
 try:
@@ -816,6 +827,8 @@ class RAGChatbot:
         If this is a greeting or casual message, transform it into a request for information
         about Henry George's core ideas.
         
+        Identify if it is greeting and then transform it into a request for information about Henry George's way of thinking.
+
         Return only the rewritten query without explanation.
         """
         
@@ -1065,7 +1078,10 @@ class RAGChatbot:
             citations.append(citation)
         
         # Generate follow-up questions
-        follow_up_questions = self._generate_follow_up_questions(user_query, search_results)
+        follow_up_questions = self._generate_follow_up_questions(
+            last_user_query=user_query,
+            last_response=response_text
+        )
         
         # Create expert reference information
         expert_reference = {
@@ -1108,56 +1124,41 @@ class RAGChatbot:
         
         return response_text, citations, structured_response
 
-    def _generate_follow_up_questions(self, query: str, search_results: List[Dict]) -> List[str]:
-        """Generate relevant follow-up questions based on the query and search results"""
-        # Default follow-up questions related to Henry George's core ideas
-        default_questions = [
-            "How does land taxation solve poverty?",
-            "What is the link between land monopoly and climate change?",
-            "Can taxing land values help prevent the boom-and-bust cycle?",
-            "How can a land value tax address the housing crisis?",
-            "How can a land value tax help businesses and the working class?"
+    def _generate_follow_up_questions(self, last_user_query: str, last_response: str) -> List[str]:
+        """
+        Ask the LLM to propose up to 5 follow‑up questions
+        based on the user's previous query and the assistant's response.
+        """
+        system_prompt = (
+            "You are a helpful assistant that crafts relevant next questions "
+            "a user might ask, given the conversation so far."
+        )
+        user_prompt = (
+            f"User asked: \"{last_user_query}\"\n"
+            f"Assistant answered: \"{last_response}\"\n\n"
+            "Based on this, suggest up to 5 concise, on‑topic follow‑up questions "
+            "the user could ask next. Return each question on its own line."
+        )
+
+        # Call the LLM
+        result = completion(
+            model=LLM_MODEL,
+            messages=[
+                {"role": "system",  "content": system_prompt},
+                {"role": "user",    "content": user_prompt}
+            ],
+            temperature=0.7,
+            max_tokens=150
+        )
+
+        # Split lines and clean up
+        raw = result.choices[0].message.content.strip()
+        questions = [
+            q.strip(" -–·") 
+            for q in raw.splitlines() 
+            if q.strip()
         ]
-        
-        # If we have search results, try to generate more specific follow-up questions
-        if search_results:
-            # Try to identify key concepts from search results
-            concepts = set()
-            for result in search_results:
-                text = result["text"].lower()
-                
-                # Check for key Georgist concepts
-                if "land value tax" in text or "single tax" in text:
-                    concepts.add("land value tax")
-                if "monopoly" in text:
-                    concepts.add("monopoly")
-                if "poverty" in text:
-                    concepts.add("poverty")
-                if "speculation" in text:
-                    concepts.add("speculation")
-                if "rent" in text:
-                    concepts.add("rent")
-                
-            # Generate more specific questions based on concepts
-            specific_questions = []
-            for concept in concepts:
-                if concept == "land value tax":
-                    specific_questions.append("How would implementing a land value tax change our current economy?")
-                elif concept == "monopoly":
-                    specific_questions.append("What's the difference between land monopoly and other forms of monopoly?")
-                elif concept == "poverty":
-                    specific_questions.append("Why does Henry George believe poverty persists despite technological progress?")
-                elif concept == "speculation":
-                    specific_questions.append("How does land speculation contribute to economic depressions?")
-                elif concept == "rent":
-                    specific_questions.append("What did Henry George mean by 'unearned increment' in land values?")
-            
-            # If we generated enough specific questions, use those
-            if len(specific_questions) >= 3:
-                return specific_questions[:5]  # Return up to 5 specific questions
-        
-        # Otherwise return default questions
-        return default_questions
+        return questions[:5]
 
     def _classify_query(self, query: str) -> str:
         """Classify the query type for better response formatting"""
@@ -1173,430 +1174,195 @@ class RAGChatbot:
 # Initialize the chatbot
 chatbot = RAGChatbot()
 
-# Simple UI
-st.title("📚 PastPort bot")
+# 1) Callback to handle any follow‑up (either from Related Questions or chat input)
+def _handle_new_question(question: str):
+    # Add the user question immediately
+    st.session_state.messages.append({"role": "user", "content": question})
+    # Mark it pending so the next rerun will generate a bot reply
+    st.session_state.pending_question = question
+    st.rerun()
 
-# Sidebar for document list and file upload
-with st.sidebar:
-    st.header("Available Documents")
-    
-    # Get list of available namespaces (books)
-    available_namespaces = chatbot.vector_db.list_namespaces()
-    
-    # Display all available books
-    if not available_namespaces:
-        st.info("No documents found in the database. You can upload a book below.")
-    else:
-        # Format namespace names for display
-        display_names = [ns.replace('book_', '').replace('_', ' ').title() for ns in available_namespaces]
-        
-        st.write(f"**{len(available_namespaces)} documents available:**")
-        for book_name in display_names:
-            st.write(f"- {book_name}")
-        
-        # Store all namespaces in session state for querying
-        st.session_state.all_namespaces = available_namespaces
-    
-    # File upload section
-    st.divider()
-    st.header("Upload Document (Optional)")
-    uploaded_file = st.file_uploader("Upload a PDF book", type="pdf")
-    
-    if uploaded_file:
-        # Create a valid namespace name
-        default_name = re.sub(r'[^a-zA-Z0-9._-]', '_', uploaded_file.name.replace('.pdf', ''))
-        if not default_name[0].isalnum():
-            default_name = 'b_' + default_name
-        if len(default_name) > 63:
-            default_name = default_name[:60] + '_db'
-            
-        namespace = f"book_{default_name}"
-        
-        if st.button("Process Document"):
-            with st.spinner("Processing your document... This may take a while for large files."):
-                # Process the book
-                processing_result = chatbot.process_pdf(uploaded_file, namespace)
-                st.success("Document processed successfully!")
-                
-                # Display simple stats
-                st.write(f"Found {processing_result['chapter_count']} chapters")
-                st.write(f"Created {processing_result['chunks_count']} text chunks")
-                
-                # Refresh the page to update available documents
-                st.rerun()
-    
-    # Document management
-    if available_namespaces:
-        st.divider()
-        with st.expander("Document Management"):
-            # Select a document to delete
-            book_to_delete = st.selectbox(
-                "Select document to delete:",
-                options=display_names,
-                index=None
-            )
-            
-            if book_to_delete and st.button("Delete Selected Document"):
-                try:
-                    # Convert display name back to namespace
-                    namespace_to_delete = available_namespaces[display_names.index(book_to_delete)]
-                    
-                    # Delete namespace instead of entire index
-                    chatbot.vector_db.index.delete(
-                        namespace=namespace_to_delete,
-                        delete_all=True
-                    )
-                    st.success(f"Document '{book_to_delete}' deleted!")
-                    # Refresh the page
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Error: {str(e)}")
-    
-    # About section
-    st.divider()
-    st.write("Made with Pinecone, Gemini and Groq")
-
-# Chat tab (default view)
-#with tab1:
-    # Sidebar for book information 
-    with st.sidebar:
-        st.header("Available Books")
-        
-        # Get list of available namespaces (books)
-        available_namespaces = chatbot.vector_db.list_namespaces()
-        
-        if not available_namespaces:
-            st.info("No books found in the database. Please upload a book first.")
-        else:
-            # Format namespace names for display
-            display_names = [ns.replace('book_', '').replace('_', ' ').title() for ns in available_namespaces]
-            
-            # Display all available books
-            st.write(f"**{len(available_namespaces)} books available for chat:**")
-            for book_name in display_names:
-                st.write(f"- {book_name}")
-            
-            # Option to manage books
-            with st.expander("Book Management"):
-                # Select a book to delete
-                book_to_delete = st.selectbox(
-                    "Select book to delete:",
-                    options=display_names,
-                    index=None
-                )
-                
-                if book_to_delete and st.button("Delete Selected Book"):
-                    try:
-                        # Convert display name back to namespace
-                        namespace_to_delete = available_namespaces[display_names.index(book_to_delete)]
-                        
-                        # Delete namespace instead of entire index
-                        chatbot.vector_db.index.delete(
-                            namespace=namespace_to_delete,
-                            delete_all=True
-                        )
-                        st.success(f"Book '{book_to_delete}' data deleted!")
-                        # Refresh the page
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"Error: {str(e)}")
-            
-            # Store all namespaces in session state for querying
-            st.session_state.all_namespaces = available_namespaces
-        
-        # About section
-        st.divider()
-        st.write("Made with Pinecone, Gemini and Groq")
-
-    # Initialize chat history if not already done
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
-
-# Main chat area
-st.subheader("Chat with Henry George")
-
-# Initialize session state for pending questions if not already done
+# 2) Initialize session state
+if "messages" not in st.session_state:
+    st.session_state.messages = []
 if "pending_question" not in st.session_state:
     st.session_state.pending_question = None
+if "all_namespaces" not in st.session_state:
+    st.session_state.all_namespaces = []
 
-# Display chat history
-for message_idx, message in enumerate(st.session_state.messages):
-    with st.chat_message(message["role"]):
-        st.markdown(message["content"])
-        
-        # If the message has a structured response, display it
-        if message["role"] == "assistant":
-            # Handle structured response if available
-            if "structured_response" in message:
-                structured = message["structured_response"]
-                
-                # Display citations in an expander
-                if "citations" in structured:
-                    with st.expander("View Sources"):
-                        for citation_idx, citation in enumerate(structured["citations"]):
-                            st.markdown(f"**Source {citation['number']} - From {citation['book_name']}**")
-                            
-                            # Display metadata
-                            if "metadata" in citation:
-                                metadata = citation["metadata"]
-                                cols = st.columns(2)
-                                
-                                # Show chapter information
-                                if "chapter" in metadata:
-                                    cols[0].write(f"Chapter: {metadata['chapter']}")
-                                
-                                # Show page range
-                                if "pages" in metadata:
-                                    cols[1].write(f"Pages: {metadata['pages']}")
-                            
-                            # Display excerpt
-                            st.text_area("Excerpt", citation["text"], height=100, 
-                                        key=f"history_source_{message_idx}_{citation_idx}")
-                            st.divider()
-                
-                # Display expert reference
-                if "expert_reference" in structured:
-                    with st.expander("Expert Reference"):
-                        expert = structured["expert_reference"]
-                        st.markdown(f"**Name:** {expert['name']}")
-                        st.markdown(f"**Organization:** {expert['organization']}")
-                        st.markdown(f"**Contact:** {expert['email']}")
-                
-                # Display additional resources
-                if "additional_resources" in structured:
-                    with st.expander("Additional Resources"):
-                        for resource in structured["additional_resources"]:
-                            st.markdown(f"**{resource['type'].title()}:** {resource['description']}")
-                            st.markdown(f"[Learn more]({resource['url']})")
-                
-                # Display follow-up questions - FIXED VERSION
-                if "follow_up_questions" in structured:
-                    with st.expander("Related Questions"):
-                        for q_idx, question in enumerate(structured["follow_up_questions"]):
-                            # Use a unique key for each button
-                            button_key = f"followup_{message_idx}_{q_idx}_{hash(question)}"
-                            if st.button(question, key=button_key):
-                                # Add the question to chat history
-                                st.session_state.messages.append({
-                                    "role": "user", 
-                                    "content": question
-                                })
-                                # Set pending question to process on next rerun
-                                st.session_state.pending_question = question
-                                st.rerun()
-            
-            # For backward compatibility - use direct citations if structured response isn't available
-            elif "citations" in message:
-                with st.expander("View Sources"):
-                    for citation_idx, citation in enumerate(message["citations"]):
-                        st.markdown(f"**Source {citation['number']}**")
-                        
-                        # Display metadata if available
-                        if "metadata" in citation:
-                            metadata = citation["metadata"]
-                            cols = st.columns(2)
-                            
-                            # Show chapter information
-                            if "chapter" in metadata:
-                                cols[0].write(f"Chapter: {metadata['chapter']}")
-                            
-                            # Show page range
-                            if "pages" in metadata:
-                                cols[1].write(f"Pages: {metadata['pages']}")
-                        
-                        # Display excerpt
-                        st.text_area("Excerpt", citation["text"], height=100, 
-                                    key=f"history_source_{message_idx}_{citation_idx}")
-                        st.divider()
+# ——— Sidebar ———
+st.title("📚 PastPort bot")
+with st.sidebar:
+    st.header("Available Documents")
+    available_ns = chatbot.vector_db.list_namespaces()
 
-# Check if we have a pending question to answer (after displaying history)
+    if not available_ns:
+        st.info("No documents found. Upload a PDF below.")
+    else:
+        display_names = [
+            ns.replace("book_", "").replace("_", " ").title()
+            for ns in available_ns
+        ]
+        st.write(f"**{len(available_ns)} documents available:**")
+        for name in display_names:
+            st.write(f"- {name}")
+        st.session_state.all_namespaces = available_ns
+
+    st.divider()
+    st.header("Upload Document (Optional)")
+    uploaded = st.file_uploader("Upload a PDF book", type="pdf")
+    if uploaded:
+        # sanitize namespace
+        default = re.sub(r"[^A-Za-z0-9._-]", "_", uploaded.name[:-4])
+        if not default[0].isalnum(): default = "b_" + default
+        if len(default) > 63: default = default[:60] + "_db"
+        namespace = f"book_{default}"
+        if st.button("Process Document"):
+            with st.spinner("Processing your document..."):
+                res = chatbot.process_pdf(uploaded, namespace)
+            st.success("Done!")
+            st.write(f"Found {res['chapter_count']} chapters")
+            st.write(f"Created {res['chunks_count']} text chunks")
+            st.rerun()
+
+    if available_ns:
+        st.divider()
+        with st.expander("Document Management"):
+            to_delete = st.selectbox("Select document to delete:", display_names)
+            if to_delete and st.button("Delete Selected Document"):
+                ns = available_ns[display_names.index(to_delete)]
+                try:
+                    chatbot.vector_db.index.delete(namespace=ns, delete_all=True)
+                    st.success(f"Deleted '{to_delete}'")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Error: {e}")
+
+    st.divider()
+    st.write("Made with Pinecone, Gemini")
+
+# ——— Chat Area ———
+st.subheader("Chat with Henry George")
+
+# 3) Render existing chat history (with citations, expert refs, resources & Related Questions)
+for msg_idx, msg in enumerate(st.session_state.messages):
+    with st.chat_message(msg["role"]):
+        st.markdown(msg["content"])
+
+        if msg["role"] == "assistant" and "structured_response" in msg:
+            structured = msg["structured_response"]
+
+            # # — View Sources —
+            # if "citations" in structured:
+            #     with st.expander("View Sources"):
+            #         for c in structured["citations"]:
+            #             st.markdown(f"**Source {c['number']} – {c['book_name']}**")
+            #             if "metadata" in c:
+            #                 md = c["metadata"]
+            #                 cols = st.columns(2)
+            #                 if "chapter" in md:
+            #                     cols[0].write(f"Chapter: {md['chapter']}")
+            #                 if "pages" in md:
+            #                     cols[1].write(f"Pages: {md['pages']}")
+            #             st.text_area("Excerpt", c["text"], height=100)
+            #             st.divider()
+
+            # — Expert Reference —
+            if "expert_reference" in structured:
+                with st.expander("Expert Reference"):
+                    er = structured["expert_reference"]
+                    st.markdown(f"**Name:** {er['name']}")
+                    st.markdown(f"**Organization:** {er['organization']}")
+                    st.markdown(f"**Contact:** {er['email']}")
+
+            # — Additional Resources —
+            if "additional_resources" in structured:
+                with st.expander("Additional Resources"):
+                    for r in structured["additional_resources"]:
+                        st.markdown(f"**{r['type'].title()}:** {r['description']}")
+                        st.markdown(f"[Learn more]({r['url']})")
+
+            # — Related Questions —
+            if "follow_up_questions" in structured:
+                with st.expander("Related Questions"):
+                    for q_idx, question in enumerate(structured["follow_up_questions"]):
+                        key = f"fu_{msg_idx}_{q_idx}"
+                        st.button(
+                            question,
+                            key=key,
+                            on_click=_handle_new_question,
+                            args=(question,)
+                        )
+
+# 4) Process any pending question (from either chat_input or Related Questions)
 if st.session_state.pending_question:
-    # Get the pending question
-    pending_question = st.session_state.pending_question
-    
-    # Clear the pending question flag to avoid repeat executions
+    user_q = st.session_state.pending_question
     st.session_state.pending_question = None
-    
-    # Display pending question as user message
-    with st.chat_message("user"):
-        st.markdown(pending_question)
-    
-    # Generate response for this pending question
+
+    # # Show the user message
+    # with st.chat_message("user"):
+    #     st.markdown(user_q)
+
+    # Generate assistant response
     with st.chat_message("assistant"):
         with st.spinner("Searching books and generating response..."):
-            try:
-                response_text, citations, structured_response = chatbot.query(
-                    st.session_state.all_namespaces,
-                    pending_question
-                )
-                
-                st.markdown(response_text)
-                
-                # Display citations in an expander
-                with st.expander("View Sources"):
-                    for citation_idx, citation in enumerate(citations):
-                        st.markdown(f"**Source {citation['number']} - From {citation['book_name']}**")
-                        
-                        # Display metadata
-                        if "metadata" in citation:
-                            metadata = citation["metadata"]
-                            cols = st.columns(2)
-                            
-                            # Show chapter information
-                            if "chapter" in metadata:
-                                cols[0].write(f"Chapter: {metadata['chapter']}")
-                            
-                            # Show page range
-                            if "pages" in metadata:
-                                cols[1].write(f"Pages: {metadata['pages']}")
-                        
-                        # Display excerpt
-                        st.text_area("Excerpt", citation["text"], height=100, 
-                                    key=f"pending_source_{citation_idx}")
-                        st.divider()
-                
-                # Expert Reference
-                if "expert_reference" in structured_response:
-                    with st.expander("Expert Reference"):
-                        expert = structured_response["expert_reference"]
-                        st.markdown(f"**Name:** {expert['name']}")
-                        st.markdown(f"**Organization:** {expert['organization']}")
-                        st.markdown(f"**Contact:** {expert['email']}")
-                
-                # Additional Resources
-                if "additional_resources" in structured_response:
-                    with st.expander("Additional Resources"):
-                        for resource in structured_response["additional_resources"]:
-                            st.markdown(f"**{resource['type'].title()}:** {resource['description']}")
-                            st.markdown(f"[Learn more]({resource['url']})")
-                
-                # Follow-up questions
-                if "follow_up_questions" in structured_response:
-                    with st.expander("Related Questions"):
-                        for q_idx, question in enumerate(structured_response["follow_up_questions"]):
-                            # Create a button for each follow-up question
-                            button_key = f"followup_pending_{q_idx}_{hash(question)}"
-                            if st.button(question, key=button_key):
-                                # Add the question to chat history
-                                st.session_state.messages.append({
-                                    "role": "user", 
-                                    "content": question
-                                })
-                                # Set pending question to process on next rerun
-                                st.session_state.pending_question = question
-                                st.rerun()
-                
-                # Save to chat history
-                st.session_state.messages.append({
-                    "role": "assistant", 
-                    "content": response_text,
-                    "citations": citations,
-                    "structured_response": structured_response
-                })
-            except Exception as e:
-                error_msg = f"An error occurred: {str(e)}"
-                st.error(error_msg)
-                st.session_state.messages.append({
-                    "role": "assistant", 
-                    "content": f"I'm sorry, I encountered an error: {str(e)}. Please try again.",
-                    "citations": []
-                })
+            resp_text, citations, structured = chatbot.query(
+                st.session_state.all_namespaces, user_q
+            )
+        st.markdown(resp_text)
 
-# Only show chat input if there are namespaces available
-if "all_namespaces" in st.session_state and st.session_state.all_namespaces:
-    user_query = st.chat_input("Ask a question about any of the books")
-    
-    if user_query:
-        # Add user message to chat history
-        st.session_state.messages.append({"role": "user", "content": user_query})
-        
-        # Display user message
-        with st.chat_message("user"):
-            st.markdown(user_query)
-        
-        # Generate response
-        with st.chat_message("assistant"):
-            with st.spinner("Searching books and generating response..."):
-                try:
-                    response_text, citations, structured_response = chatbot.query(
-                        st.session_state.all_namespaces,
-                        user_query
+        # Re‑use the same expanders as above for immediate display:
+
+        # if citations:
+        #     with st.expander("View Sources"):
+        #         for c in citations:
+        #             st.markdown(f"**Source {c['number']} – {c['book_name']}**")
+        #             if "metadata" in c:
+        #                 md = c["metadata"]
+        #                 cols = st.columns(2)
+        #                 if "chapter" in md:
+        #                     cols[0].write(f"Chapter: {md['chapter']}")
+        #                 if "pages" in md:
+        #                     cols[1].write(f"Pages: {md['pages']}")
+        #             st.text_area("Excerpt", c["text"], height=100)
+        #             st.divider()
+
+        if "expert_reference" in structured:
+            with st.expander("Expert Reference"):
+                er = structured["expert_reference"]
+                st.markdown(f"**Name:** {er['name']}")
+                st.markdown(f"**Organization:** {er['organization']}")
+                st.markdown(f"**Contact:** {er['email']}")
+
+        if "additional_resources" in structured:
+            with st.expander("Additional Resources"):
+                for r in structured["additional_resources"]:
+                    st.markdown(f"**{r['type'].title()}:** {r['description']}")
+                    st.markdown(f"[Learn more]({r['url']})")
+
+        if "follow_up_questions" in structured:
+            with st.expander("Related Questions"):
+                for q_idx, question in enumerate(structured["follow_up_questions"]):
+                    key = f"pending_fu_{q_idx}"
+                    st.button(
+                        question,
+                        key=key,
+                        on_click=_handle_new_question,
+                        args=(question,)
                     )
-                    
-                    st.markdown(response_text)
-                    
-                    # Display structured response components
-                    
-                    # # Citations
-                    # with st.expander("View Sources"):
-                    #     for citation_idx, citation in enumerate(citations):
-                    #         st.markdown(f"**Source {citation['number']} - From {citation['book_name']}**")
-                            
-                    #         # Display metadata
-                    #         if "metadata" in citation:
-                    #             metadata = citation["metadata"]
-                    #             cols = st.columns(2)
-                                
-                    #             # Show chapter information
-                    #             if "chapter" in metadata:
-                    #                 cols[0].write(f"Chapter: {metadata['chapter']}")
-                                
-                    #             # Show page range
-                    #             if "pages" in metadata:
-                    #                 cols[1].write(f"Pages: {metadata['pages']}")
-                            
-                    #         # Display excerpt
-                    #         st.text_area("Excerpt", citation["text"], height=100, 
-                    #                     key=f"current_source_{citation_idx}")
-                    #         st.divider()
-                    
-                    # Expert Reference
-                    if "expert_reference" in structured_response:
-                        with st.expander("Expert Reference"):
-                            expert = structured_response["expert_reference"]
-                            st.markdown(f"**Name:** {expert['name']}")
-                            st.markdown(f"**Organization:** {expert['organization']}")
-                            st.markdown(f"**Contact:** {expert['email']}")
-                    
-                    # Additional Resources
-                    if "additional_resources" in structured_response:
-                        with st.expander("Additional Resources"):
-                            for resource in structured_response["additional_resources"]:
-                                st.markdown(f"**{resource['type'].title()}:** {resource['description']}")
-                                st.markdown(f"[Learn more]({resource['url']})")
-                    
-                    # Follow-up questions - FIXED VERSION
-                    if "follow_up_questions" in structured_response:
-                        with st.expander("Related Questions"):
-                            for q_idx, question in enumerate(structured_response["follow_up_questions"]):
-                                # Use a unique key that includes the question hash
-                                button_key = f"followup_current_{q_idx}_{hash(question)}"
-                                if st.button(question, key=button_key):
-                                    # Add the question to chat history
-                                    st.session_state.messages.append({
-                                        "role": "user", 
-                                        "content": question
-                                    })
-                                    # Set pending question to process on next rerun
-                                    st.session_state.pending_question = question
-                                    st.rerun()
-                    
-                    # Save to chat history
-                    st.session_state.messages.append({
-                        "role": "assistant", 
-                        "content": response_text,
-                        "citations": citations,
-                        "structured_response": structured_response
-                    })
-                    
-                except Exception as e:
-                    error_msg = f"An error occurred: {str(e)}"
-                    st.error(error_msg)
-                    st.session_state.messages.append({
-                        "role": "assistant", 
-                        "content": f"I'm sorry, I encountered an error: {str(e)}. Please try again.",
-                        "citations": []
-                    })
+
+    # Save into history
+    st.session_state.messages.append({
+        "role": "assistant",
+        "content": resp_text,
+        "citations": citations,
+        "structured_response": structured
+    })
+
+# 5) Finally: chat_input to ask a fresh question
+if st.session_state.all_namespaces:
+    new_q = st.chat_input("Ask a question about any of the books")
+    if new_q:
+        _handle_new_question(new_q)
 else:
-    # If no books are available yet, show instructions
-    st.info("No books found in the database. Please upload a book in the sidebar to get started.")
+    st.info("No books found. Please upload one in the sidebar to get started.")
