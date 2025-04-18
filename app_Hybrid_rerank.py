@@ -11,6 +11,7 @@ import uuid
 import time
 from typing import List, Dict, Tuple, Any
 import random
+from functools import lru_cache
 
 # Configure the page
 st.set_page_config(
@@ -28,18 +29,20 @@ def _on_followup_click(question):
     # mark it for processing
     st.session_state.pending_question = question
     # re‑run immediately
-    st.rerun()
+    #st.rerun()
 
 
 # Constants
 # Handle API keys with fallback for development
 try:
     GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY", "")
+    OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
     GROQ_API_KEY = st.secrets.get("GROQ_API_KEY", "")
     PINECONE_API_KEY = st.secrets.get("PINECONE_API_KEY", "")
 except:
     # Fallback for development
     GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+    OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
     GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
     PINECONE_API_KEY = os.environ.get("PINECONE_API_KEY", "")
     
@@ -49,20 +52,22 @@ except:
         st.error("No Groq API key found. Please set it up in .streamlit/secrets.toml or as an environment variable.")
     if not PINECONE_API_KEY:
         st.error("No Pinecone API key found. Please set it up in .streamlit/secrets.toml or as an environment variable.")
+    if not OPENAI_API_KEY:
+        st.error("No OpenAI API key found. Please set it up in .streamlit/secrets.toml or as an environment variable.")
 
-CHUNK_SIZE = 1500
-CHUNK_OVERLAP = 300
+CHUNK_SIZE = 800
+CHUNK_OVERLAP = 200
 EMBEDDING_DIMENSION = 1536  # Dimension for Gemini embedding
 EMBEDDING_MODEL = "gemini-embedding-exp-03-07"
 PINECONE_INDEX_NAME = "hg-index-hybrid"
 PINECONE_CLOUD = "aws"  # or "gcp"
 PINECONE_REGION = "us-east-1"  # Choose appropriate region
-LLM_MODEL = "gemini/gemini-2.0-flash"
+LLM_MODEL ="groq/llama-3.3-70b-versatile"         #"gpt-4o-mini" "gemini/gemini-2.5-pro-exp-03-25" "gemini/gemini-2.0-flash"
 
 # Advanced configuration
 SEARCH_CONFIG = {
     "default_results": 5,
-    "max_results": 10,
+    "max_results": 7,
     "min_similarity": 0.65  # Minimum similarity score for returned documents
 }
 
@@ -70,6 +75,7 @@ SEARCH_CONFIG = {
 if GEMINI_API_KEY:
     from litellm import completion
     os.environ["GEMINI_API_KEY"] = GEMINI_API_KEY
+    os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
     # Set up Gemini API key
     genai.configure(api_key=GEMINI_API_KEY)
 if GROQ_API_KEY:
@@ -213,27 +219,35 @@ class PDFProcessor:
         current_chunk_text = []
         current_chunk_size = 0
         current_page_start = 0
+        current_paragraph_num = 0
         current_chapter = None
         
         for page_idx, page_data in enumerate(pages_data):
             page_num = page_idx + 1
             page_text = self.clean_text(page_data["text"])
-            page_lines = page_text.split('\n')
+            
+            # Split by paragraphs to maintain paragraph boundaries
+            paragraphs = re.split(r'\n\s*\n', page_text)
             
             # Get chapter for this page
             chapter = find_chapter(page_num)
             
-            # Process page line by line
-            for line in page_lines:
-                words = line.split()
+            # Process page paragraph by paragraph
+            for para_idx, paragraph in enumerate(paragraphs):
+                current_paragraph_num += 1
                 
-                # Add words to current chunk
-                for word in words:
-                    current_chunk_text.append(word)
-                    current_chunk_size += len(word) + 1  # +1 for space
+                # Skip empty paragraphs
+                if not paragraph.strip():
+                    continue
+                    
+                # Add paragraph to current chunk
+                words = paragraph.split()
                 
-                # If chunk is large enough and at a good breaking point
-                if current_chunk_size >= CHUNK_SIZE and line.endswith(('.', '?', '!')):
+                # Check if adding this paragraph would exceed chunk size
+                paragraph_size = len(paragraph)
+                
+                # If adding this paragraph would exceed chunk size, create a new chunk
+                if current_chunk_size + paragraph_size > CHUNK_SIZE and current_chunk_text:
                     chunk_text = ' '.join(current_chunk_text)
                     chunk_id = str(uuid.uuid4())
                     
@@ -244,7 +258,10 @@ class PDFProcessor:
                         "chunk_id": chunk_id,
                         "start_page": current_page_start,
                         "end_page": page_num,
-                        "keywords": keywords  # Add keywords to metadata
+                        "start_paragraph": max(1, current_paragraph_num - len(current_chunk_text)),
+                        "end_paragraph": current_paragraph_num - 1,
+                        "keywords": keywords,
+                        "exact_location": f"p.{current_page_start}-{page_num}, para.{max(1, current_paragraph_num - len(current_chunk_text))}-{current_paragraph_num - 1}"
                     }
                     
                     # Add chapter info if available
@@ -258,12 +275,15 @@ class PDFProcessor:
                         "metadata": metadata
                     })
                     
-                    # Keep some overlap for context
-                    overlap_words = min(len(current_chunk_text), CHUNK_OVERLAP // 10)
-                    current_chunk_text = current_chunk_text[-overlap_words:]
-                    current_chunk_size = sum(len(word) + 1 for word in current_chunk_text)
+                    # Reset for next chunk with overlap
+                    current_chunk_text = []
+                    current_chunk_size = 0
                     current_page_start = page_num
                     current_chapter = chapter
+                
+                # Add paragraph to current chunk
+                current_chunk_text.append(paragraph)
+                current_chunk_size += paragraph_size
         
         # Add the final chunk if there's anything left
         if current_chunk_text:
@@ -277,7 +297,10 @@ class PDFProcessor:
                 "chunk_id": chunk_id,
                 "start_page": current_page_start,
                 "end_page": len(pages_data),
-                "keywords": keywords  # Add keywords to metadata
+                "start_paragraph": max(1, current_paragraph_num - len(current_chunk_text) + 1),
+                "end_paragraph": current_paragraph_num,
+                "keywords": keywords,
+                "exact_location": f"p.{current_page_start}-{len(pages_data)}, para.{max(1, current_paragraph_num - len(current_chunk_text) + 1)}-{current_paragraph_num}"
             }
             
             # Add chapter info if available
@@ -468,88 +491,82 @@ class VectorDB:
                     query: str, 
                     namespace: str,
                     n_results: int = 5) -> List[Dict[str, Any]]:
-        """
-        Consolidated hybrid search function with chapter awareness and reranking.
-        This replaces all previous search methods with a single, comprehensive implementation.
-        """
+        """Improved hybrid search with better performance"""
         # Create query embedding
         query_embedding = self._create_embedding(query)
         
         # Extract keywords from query
         query_keywords = self.extract_keywords_from_text(query)
-        print(f"Query keywords: {query_keywords}")
         
         # Extract any chapter reference from the query
         chapter_info = self._extract_chapter_reference(query)
-        if chapter_info:
-            print(f"Detected chapter reference: {chapter_info}")
         
-        # Build metadata filter based on chapters and keywords
-        final_filter = self._build_search_filter(query_keywords, chapter_info)
+        # Top-K for initial search - keep this reasonable
+        top_k_search = min(n_results * 2, 10)
         
-        # Build search parameters
-        search_params = {
-            "namespace": namespace,
-            "vector": query_embedding,
-            "top_k": n_results * 2,  # Get more initial results for reranking
-            "include_metadata": True
-        }
+        # Build metadata filter
+        metadata_filter = self._build_search_filter(query_keywords, chapter_info)
         
-        # Add filter if available
-        if final_filter:
-            search_params["filter"] = final_filter
-            print(f"Using filter: {final_filter}")
-        
-        # Add reranking
-        search_params["rerank"] = {
-            "model": "bge-reranker-v2-m3",  # Or another suitable reranker
-            "top_n": n_results,
-            "rank_fields": ["text"]  # The field containing content to rerank
-        }
-        
+        # Initial semantic search
         try:
-            # Execute search
-            search_results = self.index.query(**search_params)
+            semantic_results = self.index.query(
+                namespace=namespace,
+                vector=query_embedding,
+                top_k=top_k_search,
+                include_metadata=True,
+                filter=metadata_filter if metadata_filter else None
+            )
             
-            # Format results
-            results = []
-            for match in search_results.matches:
-                # Get text content and metadata
-                text = match.metadata.get("text", "")
+            # Process results and add keyword match scores
+            enhanced_results = []
+            
+            for match in semantic_results.matches:
+                # Basic info
                 metadata = match.metadata
+                text = metadata.get("text", "")
                 
-                # Count keyword matches for reference
-                keyword_matches = 0
-                for field_idx in range(10):
-                    field_name = f"kw_{field_idx}"
-                    if field_name in metadata and metadata[field_name] in query_keywords:
-                        keyword_matches += 1
+                # Calculate exact keyword matches - optimize this computation
+                keyword_matches = sum(1 for keyword in query_keywords if re.search(r'\b' + re.escape(keyword) + r'\b', text.lower()))
+                keyword_score = keyword_matches * 0.1
                 
-                # Prepare book and chapter information
+                # Calculate hybrid score
+                hybrid_score = (match.score * 0.7) + (keyword_score * 0.3)
+                
+                # Boost for chapter matches
+                if chapter_info and (
+                    ("number" in chapter_info and str(metadata.get("chapter_number", "")) == str(chapter_info["number"])) or
+                    ("title" in chapter_info and chapter_info["title"].lower() in metadata.get("chapter_title", "").lower())
+                ):
+                    hybrid_score += 0.2
+                
+                # Create book info
                 book_info = {
-                    "title": "Progress and Poverty" if "Progress" in namespace else namespace.replace('book_', '').replace('_', ' ').title(),
+                    "title": namespace.replace('book_', '').replace('_', ' ').title(),
                     "chapter": metadata.get("chapter_number", ""),
                     "chapter_title": metadata.get("chapter_title", ""),
-                    "pages": f"{metadata.get('start_page', 'N/A')}-{metadata.get('end_page', 'N/A')}"
+                    "pages": f"{metadata.get('start_page', 'N/A')}-{metadata.get('end_page', 'N/A')}",
+                    "exact_location": metadata.get("exact_location", "")
                 }
                 
-                results.append({
+                enhanced_results.append({
                     "id": match.id,
                     "text": text,
                     "metadata": metadata,
                     "book_info": book_info,
-                    "score": match.score,
-                    "keyword_matches": keyword_matches
+                    "semantic_score": match.score,
+                    "keyword_matches": keyword_matches,
+                    "keyword_score": keyword_score,
+                    "hybrid_score": hybrid_score
                 })
             
-            return results
+            # Sort by hybrid score
+            enhanced_results.sort(key=lambda x: x["hybrid_score"], reverse=True)
             
+            # Limit to requested number
+            return enhanced_results[:n_results]
+        
         except Exception as e:
-            # Handle errors gracefully
             print(f"Search error: {str(e)}")
-            print(f"Filter used: {final_filter}")
-            
-            # Try progressive fallbacks
             return self._try_fallback_searches(query_embedding, namespace, n_results, chapter_info, query_keywords)
         
     def _extract_chapter_reference(self, query: str) -> Dict[str, Any]:
@@ -657,7 +674,7 @@ class VectorDB:
                         namespace=namespace,
                         vector=query_embedding,
                         filter=chapter_filter,
-                        top_k=n_results,
+                        top_k=min(n_results, 5),  # Limit to 5 max
                         include_metadata=True
                     )
                     
@@ -682,6 +699,29 @@ class VectorDB:
                             })
                         
                         return results
+                
+                # Calculate hybrid score for consistent ranking
+                for result in results:
+                    # Basic hybrid score based on semantic similarity
+                    result["hybrid_score"] = result["score"]
+                    
+                    # Add keyword boost if we have keywords
+                    if query_keywords:
+                        text = result.get("text", "")
+                        keyword_matches = 0
+                        for keyword in query_keywords:
+                            if re.search(r'\b' + re.escape(keyword) + r'\b', text.lower()):
+                                keyword_matches += 1
+                        
+                        keyword_score = keyword_matches * 0.1
+                        result["hybrid_score"] = (result["score"] * 0.7) + (keyword_score * 0.3)
+                    
+                    # Add chapter boost if applicable
+                    if chapter_info and (
+                        ("number" in chapter_info and str(result["metadata"].get("chapter_number", "")) == str(chapter_info["number"])) or
+                        ("title" in chapter_info and chapter_info["title"].lower() in result["metadata"].get("chapter_title", "").lower())
+                    ):
+                        result["hybrid_score"] += 0.2  # Add fixed boost for chapter matches
             except Exception as e:
                 print(f"Chapter filter fallback error: {str(e)}")
         
@@ -812,22 +852,19 @@ class RAGChatbot:
         # Use LLM to rewrite the query in a way that will better match your knowledge base
         system_prompt = """
         You are a query optimization assistant. Your task is to rewrite user queries to make them more 
-        effective for retrieval from a knowledge base about Henry George's economic theories.
+        effective for retrieval from a knowledge base.
         
-        For short queries or casual language, expand them into more detailed questions.
-        For specific examples, broaden them to include relevant economic principles.
+        For short queries or casual language, expand them into more detailed questions without changing the original intent.
+        
         """
         
         user_prompt = f"""
         Original query: {user_query}
         
         Rewrite this query to be more effective for retrieving information from a knowledge base
-        about Henry George's economic theories, land value taxation, and economic principles.
         
         If this is a greeting or casual message, transform it into a request for information
-        about Henry George's core ideas.
-        
-        Identify if it is greeting and then transform it into a request for information about Henry George's way of thinking.
+        without changing the original intent.
 
         Return only the rewritten query without explanation.
         """
@@ -858,8 +895,40 @@ class RAGChatbot:
         # Default to book question
         return "book_question"
     
+    @lru_cache(maxsize=5)
+    def _get_llm_response(self, prompt, temperature=0.3):
+        """Cache LLM responses for similar prompts"""
+        return completion(
+            model=LLM_MODEL,  
+            messages=[
+                {"role": "system", "content": "You are a helpful assistant that provides well-cited answers about books."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=temperature
+        )
+    
+    def _extract_citations(self, text: str) -> List:
+        """Extract citation information from response text"""
+        # Look for different citation patterns
+        patterns = [
+            r'\(([^,]+),\s*(?:Chapter|Book)\s*(\w+)[^,]*,\s*(?:Page|Pages)\s*(\d+[-\d]*)\)',  # Standard format
+            r'\(([^,]+),\s*(?:Chapter|Book)\s*(\w+)[^,\)]*\)',  # Without page numbers
+            r'"([^"]+)"\s*\(([^,]+),\s*(?:Chapter|Book)\s*(\w+)[^,\)]*\)'  # Quote followed by citation
+        ]
+        
+        all_citations = []
+        for pattern in patterns:
+            found = re.findall(pattern, text)
+            if found:
+                all_citations.extend(found)
+        
+        return all_citations
+    
     def query(self, namespaces: List[str], user_query: str) -> Tuple[str, List[Dict], Dict]:
         """Query with improved handling for difficult queries"""
+        
+        # Track timing for performance analysis
+        start_time = time.time()
         
         # Step 1: Try to improve the query if needed
         original_query = user_query
@@ -868,11 +937,15 @@ class RAGChatbot:
         
         # Step 2: First try with original query
         all_search_results = []
+        
+        # Limit per-namespace results to avoid excessive retrieval
+        per_namespace = max(1, min(3, SEARCH_CONFIG["default_results"] // len(namespaces)))
+        
         for namespace in namespaces:
             namespace_results = self.vector_db.hybrid_search(
                 query=original_query,
                 namespace=namespace,
-                n_results=max(1, SEARCH_CONFIG["default_results"] // len(namespaces))
+                n_results=per_namespace
             )
             
             # Add source namespace to each result
@@ -883,10 +956,11 @@ class RAGChatbot:
             all_search_results.extend(namespace_results)
         
         # Sort results by score
-        all_search_results.sort(key=lambda x: x["score"], reverse=True)
+        all_search_results.sort(key=lambda x: x.get("hybrid_score", x.get("score", 0)), reverse=True)
         
         # Step 3: If results are poor, try with rewritten query
-        if not all_search_results or (all_search_results and max(r["score"] for r in all_search_results) < 0.6):
+        if not all_search_results or (all_search_results and 
+                                    max(r.get("hybrid_score", r.get("score", 0)) for r in all_search_results) < 0.6):
             print(f"Results for original query insufficient, trying rewritten query: {rewritten_query}")
             
             second_search_results = []
@@ -894,7 +968,7 @@ class RAGChatbot:
                 namespace_results = self.vector_db.hybrid_search(
                     query=rewritten_query,
                     namespace=namespace,
-                    n_results=max(1, SEARCH_CONFIG["default_results"] // len(namespaces))
+                    n_results=per_namespace
                 )
                 
                 # Add source namespace
@@ -904,20 +978,25 @@ class RAGChatbot:
                 
                 second_search_results.extend(namespace_results)
             
-            # Sort results by score
-            second_search_results.sort(key=lambda x: x["score"], reverse=True)
+            # Sort results by hybrid score
+            second_search_results.sort(key=lambda x: x.get("hybrid_score", x.get("score", 0)), reverse=True)
             
             # Use rewritten query results if they're better
             if (second_search_results and 
                 (not all_search_results or 
                 (second_search_results and all_search_results and 
-                max(r["score"] for r in second_search_results) > max(r["score"] for r in all_search_results)))):
+                max(r.get("hybrid_score", r.get("score", 0)) for r in second_search_results) > 
+                max(r.get("hybrid_score", r.get("score", 0)) for r in all_search_results)))):
                 all_search_results = second_search_results
                 query_used = rewritten_query
         
-        # Limit to top results
-        max_total_results = max(5, min(len(namespaces) * 2, 10))
+        # Limit to top results - keep this number small
+        max_total_results = max(3, min(5, len(namespaces) * 2))
         search_results = all_search_results[:max_total_results]
+        
+        # Measure search time
+        search_time = time.time() - start_time
+        print(f"Search completed in {search_time:.2f} seconds, found {len(search_results)} results")
         
         # If no results found, handle appropriately
         if not search_results:
@@ -956,39 +1035,51 @@ class RAGChatbot:
             })
             
             return no_info_response, [], structured_response
-        
+
         # Prepare context from search results
         context_parts = []
         for i, result in enumerate(search_results):
-            # Build context entry
+            # Build context entry with clear citation information
             book_info = result.get("book_info", {})
-            if not book_info:
-                # Create book_info if not already present
-                book_info = {
-                    "title": result["book_name"],
-                    "chapter": result["metadata"].get("chapter_number", ""),
-                    "chapter_title": result["metadata"].get("chapter_title", ""),
-                    "pages": f"{result['metadata'].get('start_page', 'N/A')}-{result['metadata'].get('end_page', 'N/A')}"
-                }
-                result["book_info"] = book_info
-                
-            context_entry = f"Document {i+1} (from {book_info['title']}):"
-            metadata = result["metadata"]
             
-            # Add chapter information if available
-            if "chapter_title" in metadata:
-                context_entry += f" Chapter: {metadata.get('chapter_number', '')}: {metadata.get('chapter_title', '')}"
-                
-            # Add page information
-            context_entry += f" (Pages {book_info['pages']})"
+            # Create citation reference ID
+            citation_id = f"[{i+1}]"
             
-            # Add the document text
-            context_entry += f"\n{result['text']}"
+            # Format context with clear document boundaries and citation information
+            context_entry = f"""
+        [DOCUMENT {i+1}]
+        BOOK: {book_info['title']}
+        LOCATION: Chapter {book_info['chapter']}: {book_info['chapter_title']}
+        PAGES: {book_info['pages']}
+        CITATION: {citation_id}
+
+        {result['text']}
+        [END DOCUMENT {i+1}]
+        """
             
             context_parts.append(context_entry)
             
         context = "\n\n".join(context_parts)
     
+        # Create citation map for reference
+        citation_map = {}
+        for i, result in enumerate(search_results):
+            book_info = result.get("book_info", {})
+            citation_id = i+1
+            
+            citation_map[citation_id] = {
+                "book": book_info['title'],
+                "chapter": f"Chapter {book_info['chapter']}",
+                "chapter_title": book_info['chapter_title'],
+                "pages": book_info['pages'],
+                "exact_location": book_info.get('exact_location', '')
+            }
+        relevant_quotes = self._extract_relevant_quotes(search_results, user_query)
+        quotes_text = ""
+        if relevant_quotes:
+            quotes_text = "\n\nRelevant quotes to consider:\n"
+            for i, quote in enumerate(relevant_quotes):
+                quotes_text += f"{i+1}. \"{quote['text']}\" ({quote['source']})\n"
         
         # Create prompt for LLM
         prompt = f"""
@@ -1026,15 +1117,39 @@ class RAGChatbot:
     You should use the 19th century American English for your responses.
     
 
-    Important: You MUST directly cite relevant sections from my books where appropriate, using the format (Book Title, Book X, Ch. Y).
-    Double check before giving the citations
+
+    INSTRUCTIONS FOR CITING SOURCES:
+    1. You MUST directly quote short passages from the provided documents where appropriate.
+    2. When quoting or referencing information, always cite using the format: (Book Title, Chapter X: Chapter Title, Page Y).
+    3. Use citation markers [1], [2], etc. from the documents to help track which source is being used.
+    4. For each citation, include the exact book, chapter, and page number information provided in the document.
+    5. Do not make up or invent citations - only use the citation information provided in the documents.
+    6. Direct quotes should be enclosed in quotation marks and followed by a citation.
+    7. Even when paraphrasing, include a citation to the relevant document.
+    8. Try to include at least 2-3 direct quotes from the source material in your response.
+
+    For example: ‘High property prices…tax its value. (See Progress and Poverty, Book VII, Chapter I).’
+    Then under a heading ‘For readings I would urge you to read:’ list two lines like “Progress and Poverty, Book V, Chapter 5” and “Progress and Poverty, Book VII, Chapter I.”
+
+    Example of the final output you’ll get:
+    Answer:
+    “High property prices are a consequence of land monopoly. When land is privately owned and demand outstrips supply, its price rises, enriching the landowner without any effort on their part and forcing common people into poverty. To remedy this, society must recognize land as common property and tax its value. (See Progress and Poverty, Book VII, Chapter I).”
+
+    For readings I would urge you to read:
+
+    Progress and Poverty, Book V, Chapter 5
+
+    Progress and Poverty, Book VII, Chapter I
 
             Context from the books:
             {context}
             
             Original Question: {user_query}
             {f"Rewritten for better retrieval as: {rewritten_query}" if query_used != user_query else ""}
+    
+    {quotes_text}
 
+    REMEMBER: Direct quotes from the text must be in quotation marks and properly cited.
             
             Answer:
             """
@@ -1050,7 +1165,33 @@ class RAGChatbot:
         )
 
         response_text = response.choices[0].message.content
-        
+
+        # Process response to ensure citations are properly formatted
+        found_citations = self._extract_citations(response_text)
+
+        # # If no properly formatted citations are found, add a note
+        # if not found_citations and any(doc.get("book_info") for doc in search_results):
+        #     citation_reminder = "\n\nNote: For more specific information, please refer to the following sources:\n"
+        #     for i, result in enumerate(search_results[:3]):  # Add top 3 sources
+        #         book_info = result.get("book_info", {})
+        #         citation_reminder += f"- {book_info['title']}, Chapter {book_info['chapter']}: {book_info['chapter_title']}, Pages {book_info['pages']}\n"
+            
+        #     # Add a sample quote if available
+        #     if relevant_quotes:
+        #         citation_reminder += f"\nFor example, in {relevant_quotes[0]['source']}, I wrote: \"{relevant_quotes[0]['text']}\""
+            
+        #     response_text += citation_reminder
+
+        # # If no properly formatted citations are found, add a note
+        # if not found_citations and any(doc.get("book_info") for doc in search_results):
+        #     citation_reminder = "\n\nNote: For more specific information, please refer to the following sources:\n"
+        #     for i, result in enumerate(search_results[:3]):  # Add top 3 sources
+        #         book_info = result.get("book_info", {})
+        #         citation_reminder += f"- {book_info['title']}, Chapter {book_info['chapter']}: {book_info['chapter_title']}, Pages {book_info['pages']}\n"
+            
+        #     response_text += citation_reminder
+
+        # print(context)
         # Create citation data for displaying sources
         citations = []
         for i, result in enumerate(search_results):
@@ -1072,7 +1213,7 @@ class RAGChatbot:
             citation["metadata"]["pages"] = book_info["pages"]
             
             # Add relevance score
-            similarity_score = round(result["score"] * 100, 1)
+            similarity_score = round(result.get("hybrid_score", result.get("score", 0)) * 100, 1)
             citation["metadata"]["relevance"] = f"{similarity_score}%"
             
             citations.append(citation)
@@ -1123,6 +1264,44 @@ class RAGChatbot:
         })
         
         return response_text, citations, structured_response
+    
+    def _extract_relevant_quotes(self, search_results, query):
+        """Extract the most relevant quotes from search results for citation"""
+        quotes = []
+        
+        # Extract keywords from query
+        query_keywords = self.vector_db.extract_keywords_from_text(query, max_keywords=5)
+        
+        for result in search_results:
+            text = result["text"]
+            book_info = result["book_info"]
+            
+            # Split text into sentences
+            sentences = re.split(r'(?<=[.!?])\s+', text)
+            
+            # Score sentences by keyword matches
+            scored_sentences = []
+            for sentence in sentences:
+                if len(sentence) < 10:  # Skip very short sentences
+                    continue
+                    
+                # Count keyword matches
+                keyword_count = sum(1 for kw in query_keywords if re.search(r'\b' + re.escape(kw) + r'\b', sentence.lower()))
+                scored_sentences.append((sentence, keyword_count))
+            
+            # Sort by keyword matches
+            scored_sentences.sort(key=lambda x: x[1], reverse=True)
+            
+            # Take top 2 sentences if available
+            top_sentences = [s[0] for s in scored_sentences[:2] if s[1] > 0]
+            
+            if top_sentences:
+                quotes.append({
+                    "text": " ".join(top_sentences),
+                    "source": f"{book_info['title']}, Chapter {book_info['chapter']}: {book_info['chapter_title']}, Pages {book_info['pages']}"
+                })
+        
+        return quotes[:3]  # Return top 3 quotes
 
     def _generate_follow_up_questions(self, last_user_query: str, last_response: str) -> List[str]:
         """
@@ -1151,11 +1330,21 @@ class RAGChatbot:
             max_tokens=150
         )
 
-        # Split lines and clean up
-        raw = result.choices[0].message.content.strip()
+        # Safely extract the returned text
+        choice = result.choices[0]
+        if hasattr(choice, 'message') and choice.message and choice.message.content:
+            raw = choice.message.content
+        elif hasattr(choice, 'text') and choice.text:
+            raw = choice.text
+        else:
+            raw = ""
+
+        raw = raw.strip()
+
+        # Then split into lines as before
         questions = [
-            q.strip(" -–·") 
-            for q in raw.splitlines() 
+            q.strip(" -–·")
+            for q in raw.splitlines()
             if q.strip()
         ]
         return questions[:5]
@@ -1170,6 +1359,7 @@ class RAGChatbot:
             return "explanatory"
         else:
             return "general"
+    
 
 # Initialize the chatbot
 chatbot = RAGChatbot()
